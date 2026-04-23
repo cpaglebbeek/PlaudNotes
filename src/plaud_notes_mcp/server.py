@@ -245,21 +245,21 @@ def get_recording_detail(file_id: str) -> str:
         # Build a clean summary of the detail
         result: dict = {
             "file_id": file_id,
-            "filename": detail.get("filename", "Unknown"),
+            "filename": detail.get("file_name", detail.get("filename", "Unknown")),
             "duration_ms": detail.get("duration", 0),
         }
 
-        # Extract transcript text
+        # Extract transcript text (now inlined by get_recording_detail)
         trans_result = detail.get("trans_result", {})
         if isinstance(trans_result, dict):
             segments = trans_result.get("segments", [])
             if segments:
                 result["transcript_segments"] = len(segments)
                 result["transcript_preview"] = " ".join(
-                    s.get("text", "") for s in segments[:10]
+                    s.get("content", s.get("text", "")) for s in segments[:10]
                 )
 
-        # Extract AI summary
+        # Extract AI summary (now inlined by get_recording_detail)
         ai_content = detail.get("ai_content", "")
         if ai_content:
             if isinstance(ai_content, dict):
@@ -268,6 +268,11 @@ def get_recording_detail(file_id: str) -> str:
                 )
             else:
                 result["ai_summary"] = str(ai_content)
+
+        # Include extra summaries if present
+        extra = detail.get("extra_summaries", [])
+        if extra:
+            result["extra_summaries"] = extra
 
         return json.dumps(result, indent=2)
     except PlaudAuthError as e:
@@ -409,7 +414,8 @@ def get_user_info() -> str:
     try:
         client = _get_client()
         info = client.get_user_info()
-        return json.dumps({"user": info}, indent=2)
+        result = {"user": info, "token_status": client.token_status}
+        return json.dumps(result, indent=2)
     except PlaudAuthError as e:
         return f"Authentication error: {e}"
     except PlaudAPIError as e:

@@ -22,6 +22,7 @@ cli = ["mcp[cli]>=1.0.0"]
 
 [project.scripts]
 plaud-notes-mcp = "plaud_notes_mcp.server:main"
+plaud-refresh-token = "plaud_notes_mcp.refresh_token:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

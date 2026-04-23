@@ -7,6 +7,8 @@ at api.plaud.ai used by web.plaud.ai.
 
 from __future__ import annotations
 
+import base64
+import json as _json
 import logging
 import os
 import re
@@ -101,10 +103,10 @@ class TranscriptSegment:
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> TranscriptSegment:
         return cls(
-            text=data.get("text", ""),
+            text=data.get("content", data.get("text", "")),
             speaker=data.get("speaker", data.get("spk", "")),
-            start_ms=data.get("start_time_ms", data.get("start", data.get("bg", 0))),
-            end_ms=data.get("end_time_ms", data.get("end", data.get("ed", 0))),
+            start_ms=data.get("start_time", data.get("start_time_ms", data.get("start", data.get("bg", 0)))),
+            end_ms=data.get("end_time", data.get("end_time_ms", data.get("end", data.get("ed", 0)))),
         )
 
 
@@ -169,6 +171,7 @@ class PlaudClient:
         api_domain: str | None = None,
     ):
         self._token = self._resolve_token(token)
+        self._check_token_expiry()
         if api_domain:
             self._base_url = self._validate_api_url(api_domain)
         else:
@@ -179,6 +182,8 @@ class PlaudClient:
             headers=self._build_headers(),
             timeout=DEFAULT_TIMEOUT,
         )
+        # Separate client for downloading content from S3 (no auth headers)
+        self._download_client = httpx.Client(timeout=DEFAULT_TIMEOUT)
 
     @staticmethod
     def _validate_file_id(file_id: str) -> str:
@@ -246,11 +251,75 @@ class PlaudClient:
             "Authorization header."
         )
 
+    def _check_token_expiry(self) -> None:
+        """Decode JWT and warn if token is near expiry or expired."""
+        try:
+            parts = self._token.split(".")
+            if len(parts) < 2:
+                return
+            # Decode payload (add padding)
+            payload_b64 = parts[1] + "=="
+            payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+            exp = payload.get("exp")
+            if not exp:
+                return
+            exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+            now = datetime.now(tz=timezone.utc)
+            days_left = (exp_dt - now).days
+            self._token_expiry = exp_dt
+            self._token_days_left = days_left
+
+            if days_left < 0:
+                logger.error(
+                    "Plaud token EXPIRED on %s (%d days ago). "
+                    "Run: plaud-refresh-token",
+                    exp_dt.isoformat(), abs(days_left),
+                )
+            elif days_left < 30:
+                logger.warning(
+                    "Plaud token expires in %d days (%s). "
+                    "Run: plaud-refresh-token",
+                    days_left, exp_dt.isoformat(),
+                )
+            else:
+                logger.debug(
+                    "Plaud token valid for %d more days (expires %s)",
+                    days_left, exp_dt.isoformat(),
+                )
+        except Exception:
+            # Don't crash on token decode failures
+            self._token_expiry = None
+            self._token_days_left = None
+
+    @property
+    def token_status(self) -> dict[str, Any]:
+        """Return token expiry info."""
+        return {
+            "expires": self._token_expiry.isoformat() if hasattr(self, '_token_expiry') and self._token_expiry else "unknown",
+            "days_left": getattr(self, '_token_days_left', None),
+        }
+
     def _build_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
         }
+
+    def _download_content(self, url: str) -> Any:
+        """Download content from an S3 pre-signed URL.
+
+        Handles both gzipped and plain JSON responses.
+        """
+        resp = self._download_client.get(url, timeout=30)
+        resp.raise_for_status()
+        content = resp.content
+        # Try gzip first, fall back to plain
+        try:
+            import gzip
+            content = gzip.decompress(content)
+        except Exception:
+            pass
+        return _json.loads(content)
 
     def _request(
         self,
@@ -367,10 +436,65 @@ class PlaudClient:
         return [Recording.from_api(f) for f in files]
 
     def get_recording_detail(self, file_id: str) -> dict[str, Any]:
-        """Get full detail for a recording including transcript and AI content."""
+        """Get full detail for a recording including transcript and AI content.
+
+        The API returns content via content_list with S3 URLs.
+        This method downloads and inlines the transcript and summary data
+        for backwards compatibility.
+        """
         file_id = self._validate_file_id(file_id)
         data = self._get(f"/file/detail/{file_id}")
-        return data.get("data", data)
+        detail = data.get("data", data)
+
+        # Process content_list: download and inline transcript + summaries
+        content_list = detail.get("content_list", [])
+        for item in content_list:
+            data_type = item.get("data_type", "")
+            url = item.get("data_link", "")
+            task_status = item.get("task_status")
+
+            if not url or task_status != 1:
+                continue
+
+            try:
+                content = self._download_content(url)
+
+                if data_type == "transaction":
+                    # Transcript data: list of segments
+                    detail["trans_result"] = {"segments": content if isinstance(content, list) else []}
+
+                elif data_type in ("auto_sum_note", "sum_multi_note"):
+                    # AI summary content
+                    if isinstance(content, dict):
+                        ai_text = content.get("ai_content", content.get("content", ""))
+                    elif isinstance(content, str):
+                        ai_text = content
+                    else:
+                        ai_text = str(content)
+
+                    if data_type == "auto_sum_note":
+                        detail["ai_content"] = {"content": ai_text}
+                    else:
+                        # Additional summary types (Psychotherapy Note, To-do List, etc.)
+                        title = item.get("data_title", item.get("data_tab_name", "Extra"))
+                        extra = detail.setdefault("extra_summaries", [])
+                        extra.append({"title": title, "content": ai_text})
+
+            except Exception as e:
+                logger.debug("Failed to download %s for %s: %s", data_type, file_id, e)
+
+        # Also check pre_download_content_list for inline summaries
+        for pre_item in detail.get("pre_download_content_list", []):
+            data_content = pre_item.get("data_content", "")
+            if data_content and "ai_content" not in detail:
+                try:
+                    parsed = _json.loads(data_content) if isinstance(data_content, str) else data_content
+                    if isinstance(parsed, dict) and "ai_content" in parsed:
+                        detail["ai_content"] = {"content": parsed["ai_content"]}
+                except (ValueError, TypeError):
+                    pass
+
+        return detail
 
     def get_audio_url(self, file_id: str) -> str:
         """Get a temporary download URL for the recording audio."""
@@ -544,7 +668,7 @@ class PlaudClient:
                 if isinstance(trans_result, dict):
                     segments = trans_result.get("segments", [])
                     trans_text = " ".join(
-                        s.get("text", "") for s in segments
+                        s.get("content", s.get("text", "")) for s in segments
                     )
                 if query_lower in trans_text.lower():
                     # Extract snippet around match
@@ -584,6 +708,7 @@ class PlaudClient:
 
     def close(self) -> None:
         self._client.close()
+        self._download_client.close()
 
     def __enter__(self) -> PlaudClient:
         return self
